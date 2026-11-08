@@ -21,6 +21,7 @@
 #include "haptics_apple.h"
 #include "motion_apple.h"
 #include "motion_pro_mac.h"
+#include "motion_joycon_mac.h"
 #include "pad_apple.h"
 #include "pad_hid_mac.h"
 #include "home_quit.h"
@@ -219,6 +220,15 @@ static void pro_players_changed(GCController *gone) {
     dm_motion_pro_players(count, player);
 }
 static void pro_devices_changed(void) { pro_players_changed(nil); }
+// Apple gives a Joy-Con pair no GCMotion at all, so the units' own 0x30 reports are the player's six-axis source (motion_joycon_mac.h, upstream #823).
+static void joycon_players_changed(void) {
+    int count = 0, player = -1;
+    for (GCController *c in GCController.controllers) if (c.extendedGamepad && [c.productCategory containsString:@"Joy-Con"]) {
+        count++; player = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)c);
+    }
+    dm_motion_joycon_players(count, player);
+}
+static void joycon_devices_changed(void) { joycon_players_changed(); }
 // DM_PAD_PRESS_TO_JOIN=1: a controller is no player until one of its buttons is pressed, then it is the lowest player free, as a console's "press a button" screen.
 // Whatever the port, the order of connection or the link (Bluetooth has no port), and for identical pads too: so the players pick their own order. Not with DM_PAD_MERGE
 static int pad_join(const void *owner, const char *name) {
@@ -246,6 +256,7 @@ static void pads_changed(GCController *gone) {
         if (gone) dm_motion_detach(gone, 0);
         if (!any) { if (!g_hidpads) dm_pad_set(0, 0, 0, 0, 0); dm_haptics_apple_controller(0, nil); }   // a raw HID pad still plays player 1 (pad_hid_mac.h)
         pro_players_changed(gone);
+    joycon_players_changed();
         return;
     }
     hidpad_twins_eval(gone); hidpad_twins_release();   // identical pads (pad_hid_mac.h): those GameController lists them all of again go back to it first
@@ -277,6 +288,7 @@ static void pads_changed(GCController *gone) {
     hidpad_twins_take(gone);   // the pads of a model GameController lists fewer of, a player each
     dm_pad_players(pad_slot_mask(&g_slots));
     pro_players_changed(gone);
+    joycon_players_changed();
     cp_poll();   // a controller came or went while the controller applet's prompt is up
 }
 // Display sleep: macOS counts keyboard and mouse input as user activity, not a controller's, so in controller-only play the display dims and locks; the latency
@@ -313,7 +325,8 @@ static void input_release(void) {
     [NSCursor setHiddenUntilMouseMoves:NO];
     display_awake(0);
     g_input_on = 0;
-    dm_motion_pro_active(0); hidpad_motion_clear();
+    dm_motion_pro_active(0);
+    dm_motion_joycon_active(0); hidpad_motion_clear();
     g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
     if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
     pads_release();
@@ -322,6 +335,7 @@ static void input_resume(void) {
     display_awake(1);
     g_input_on = 1;
     dm_motion_pro_active(1);
+    dm_motion_joycon_active(1);
     pads_reread();
 }
 // Raw HID gamepads (pad_hid_mac.h): a player slot each, as a GameController controller, named by the device's product name. Identical pads that GameController lists
@@ -533,6 +547,7 @@ static void pads_start(void) {
     pads_changed(nil);
     hq_log_setting();
     dm_motion_pro_start(pro_devices_changed);
+    dm_motion_joycon_start(joycon_devices_changed);
     hidpad_start();
 }
 
