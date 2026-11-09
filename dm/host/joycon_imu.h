@@ -28,7 +28,10 @@ static inline int joycon_imu_decode(jc_imu *s, const uint8_t *r, size_t len, uin
     if (!s->live && !data) return 0;   // enabled but empty is not a source: a unit at rest still reads about 1 G
     s->live = 1;
     const float g = 1.f / 4096.f, rad = (float)(2.0 * M_PI) / 13371.f;   // counts per G, counts per revolution/s
-    float sx = s->right ? -1.f : 1.f;
+    // Both units report the same raw frame on the hardware tested (a left 0x2006 and a right 0x2007 lying flat side by side both read
+    // z = -1): the left one used to be passed through, which flipped its gravity and gyro Y/Z against the right one, so a JoyDual pair's
+    // two sensors cancelled each other's tilt correction (the aim drifted toward the pose, and tilting barely moved it)
+    float sx = -1.f;
     for (int k = 0; k < 3; k++) {
         out[k] = (jc_imu_sample){{-(float)v[k][0] * g, -sx * (float)v[k][1] * g, -sx * (float)v[k][2] * g},   // gravity: flat reads (0, 0, -1)
                                  {(float)v[k][3] * rad, sx * (float)v[k][4] * rad, sx * (float)v[k][5] * rad},

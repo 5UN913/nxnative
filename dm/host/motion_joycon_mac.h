@@ -14,17 +14,19 @@
 #include <string.h>
 #include "dm_input.h"
 #include "joycon_imu.h"
+#include "pad_pro.h"
 
 enum { JC_REPORT_LEN = 0x40, JC_ASSERT_NS = 2000000000 };
 typedef struct jc_device {
     IOHIDDeviceRef hid; uint8_t in[128], out[JC_REPORT_LEN]; uint8_t packet;
-    int right; uint64_t last_raw_log; jc_imu imu; struct jc_device *next;
+    int right; uint64_t last_raw_log, side_log; jc_imu imu; pad_pro pad; struct jc_device *next;
     float bias[3], bias_sum[3]; int bias_n;
     int cal_ok; float gcorr[3];   // factory IMU calibration (SPI 0x6020): per-axis sensitivity correction
     float lp[3], fast[3]; int quiet;   // stillness detector: the bias is re-snapped whenever the unit rests
 } jc_device;
 static IOHIDManagerRef g_jc_manager;
 static jc_device *g_jc_devices, *g_jc_bound;
+static jc_device *g_jc_side[2];   // the left (0) and right (1) unit bound to this player, each its own sensor and stick
 static int g_jc_player = -1, g_jc_active = 1, g_jc_controllers, g_jc_slot = -1;
 static void (*g_jc_changed)(void);
 static dispatch_source_t g_jc_timer;
@@ -102,32 +104,51 @@ static void jc_assert_mode(jc_device *d) {
     });
 }
 static int jc_count(void) { int n = 0; for (jc_device *d = g_jc_devices; d; d = d->next) n++; return n; }
+static void jc_publish(void) {
+    if (g_jc_player < 0) return;
+    dm_joy_attach(g_jc_player, (g_jc_side[0] ? 1u : 0u) | (g_jc_side[1] ? 2u : 0u));
+}
+static void jc_reset_device(jc_device *d) {
+    d->imu = (jc_imu){0}; d->bias_n = 0; d->cal_ok = 0; d->quiet = 0; d->pad = (pad_pro){0};
+    memset(d->lp, 0, sizeof d->lp); memset(d->fast, 0, sizeof d->fast); memset(d->bias, 0, sizeof d->bias); memset(d->bias_sum, 0, sizeof d->bias_sum);
+}
 static void jc_route(void) {
-    jc_device *best = NULL;
-    for (jc_device *d = g_jc_devices; d; d = d->next) if (d->right) { best = d; break; }   // the right unit's sensor is the pair's
-    for (jc_device *d = g_jc_devices; !best && d; d = d->next) best = d;                    // a left one only while there is no right
-    int p = g_jc_controllers == 1 && g_jc_slot >= 0 ? g_jc_slot : -1;   // one Joy-Con pad and its slot: no guessing
-    jc_device *d = p >= 0 ? best : NULL;
-    if (d == g_jc_bound && p == g_jc_player) return;
-    if (g_jc_player >= 0) dm_motion_clear_hid(g_jc_player);
-    g_jc_bound = d; g_jc_player = p;
-    if (d) {
-        d->imu = (jc_imu){0}; d->bias_n = 0; d->cal_ok = 0; d->quiet = 0; memset(d->lp, 0, sizeof d->lp); memset(d->fast, 0, sizeof d->fast); memset(d->bias, 0, sizeof d->bias); memset(d->bias_sum, 0, sizeof d->bias_sum); memset(d->bias, 0, sizeof d->bias);
-        LOG("[hid] Joy-Con raw motion: player %d (%s unit, passive HID 0x30)", p + 1, d->right ? "right" : "left");
-        jc_assert_mode(d);   // the pair has a player at once: ask for 0x30 rather than wait for the timer
+    // The pair's player: the front end's slot when it has one. Apple reports a Joy-Con pair as one controller and the slot lookup can
+    // come before a unit is enumerated (or miss after the pair reconnects), so one pair of units with no slot of its own plays player 1
+    int p = g_jc_controllers >= 1 && g_jc_slot >= 0 ? g_jc_slot : (g_jc_controllers <= 1 && g_jc_devices ? 0 : -1);
+    if (p != g_jc_player) {
+        if (g_jc_player >= 0) {   // the player moved or left: its sides go with it
+            dm_motion_clear_joy(g_jc_player, 0); dm_motion_clear_joy(g_jc_player, 1); dm_motion_clear_hid(g_jc_player);
+            dm_joy_attach(g_jc_player, 0);
+        }
+        g_jc_player = p; g_jc_side[0] = g_jc_side[1] = NULL;
     }
+    if (p < 0) return;
+    for (int side = 0; side < 2; side++) {
+        jc_device *d = NULL;
+        for (jc_device *q = g_jc_devices; q; q = q->next) if ((q->right ? 1 : 0) == side) { d = q; break; }
+        if (d == g_jc_side[side]) continue;
+        if (g_jc_side[side]) { dm_motion_clear_joy(p, side); if (side) dm_motion_clear_hid(p); }
+        g_jc_side[side] = d;
+        if (d) {
+            jc_reset_device(d);
+            LOG("[hid] Joy-Con raw motion: player %d (%s unit, passive HID 0x30)", p + 1, side ? "right" : "left");
+            jc_assert_mode(d);   // the pair has a player at once: ask for 0x30 rather than wait for the timer
+        }
+    }
+    jc_publish();
 }
 static void dm_motion_joycon_players(int joycon_controllers, int slot) {
     g_jc_controllers = joycon_controllers; g_jc_slot = slot; jc_route();
 }
 static void dm_motion_joycon_active(int active) {
     g_jc_active = active;
-    if (!active && g_jc_player >= 0) dm_motion_clear_hid(g_jc_player);
+    if (!active && g_jc_player >= 0) { dm_motion_clear_joy(g_jc_player, 0); dm_motion_clear_joy(g_jc_player, 1); dm_motion_clear_hid(g_jc_player); dm_joy_attach(g_jc_player, 0); }
 }
 static void jc_report(void *ctx, IOReturn result, void *sender, IOHIDReportType type, uint32_t report_id, uint8_t *r, CFIndex len) {
     (void)sender;
     jc_device *d = ctx;
-    if (result != kIOReturnSuccess || type != kIOHIDReportTypeInput || len <= 0 || !g_jc_active || d != g_jc_bound) return;
+    if (result != kIOReturnSuccess || type != kIOHIDReportTypeInput || len <= 0 || !g_jc_active || d->right < 0 || d->right > 1 || d != g_jc_side[d->right] || g_jc_player < 0) return;
     if (report_id == 0x21) {   // a subcommand reply: ACK 0x90 in byte 13, the id in 14, the data from 15
         if (len < 16) return;
         if ((uint8_t)r[14] == 0x10) {
@@ -153,6 +174,11 @@ static void jc_report(void *ctx, IOReturn result, void *sender, IOHIDReportType 
         return;
     }
     if (report_id != 0x30) return;   // the stream is the proof of 0x30 mode; an ACK proves nothing on its own
+    {   // the same report carries this unit's buttons and stick (pad_pro.h; the Switch's 0x30 layout): the npad layer shows
+        // a JoyDual pad from these, so they must be reported for the game to see a Joy-Con style at all
+        uint64_t bm; int32_t bst[4];
+        if (pad_pro_decode(&d->pad, r, (size_t)len, &bm, bst)) dm_joy_set(g_jc_player, d->right, bm, bst[0], bst[1]);
+    }
     jc_imu_sample s[3];
     int n = joycon_imu_decode(&d->imu, r, (size_t)len, now_ns(), s);
     if (!n) return;
@@ -180,7 +206,15 @@ static void jc_report(void *ctx, IOReturn result, void *sender, IOHIDReportType 
             } else d->quiet = 0;
         }
         for (int k = 0; k < 3; k++) s[i].rot[k] = (rot[k] - d->bias[k]) * g_jc_scale[k];
-        dm_motion_set_hid(g_jc_player, s[i].acc, s[i].rot, s[i].ns);
+        // Both slots: the npad layer reads a Joy-Con style's own sensor (dm_motion_set_joy), while a full-key style reads the pad's
+        // merged one (dm_motion_set_hid). A pair whose JoyDual is not what the game picked still gets a six-axis source from the right unit
+        dm_motion_set_joy(g_jc_player, d->right, s[i].acc, s[i].rot, s[i].ns);
+        if (d->right) dm_motion_set_hid(g_jc_player, s[i].acc, s[i].rot, s[i].ns);
+        if (g_jc_raw_log && d->imu.received - d->side_log > 1000000000ull) {   // DM_MOTION_LOG=1: this unit's own mapped sample, once a second
+            d->side_log = d->imu.received;
+            LOG("[hid] Joy-Con %s: acc %+.2f %+.2f %+.2f G, gyro %+.3f %+.3f %+.3f rev/s", d->right ? "R" : "L",
+                s[i].acc[0], s[i].acc[1], s[i].acc[2], s[i].rot[0], s[i].rot[1], s[i].rot[2]);
+        }
         if (g_jc_raw_log && d->imu.received - d->last_raw_log > 100000000ull) {   // DM_MOTION_LOG=2: the raw counts, ten a second
             d->last_raw_log = d->imu.received;
             const uint8_t *b = r + 13 + 12 * i;
@@ -215,9 +249,13 @@ static void jc_removed(void *ctx, IOReturn result, void *sender, IOHIDDeviceRef 
 }
 // macOS puts a Joy-Con back to simple mode (its own sleep, or its driver), so a bound device that has stopped reporting asks again
 static void jc_assert_bound(void) {
-    jc_device *d = g_jc_bound;
-    if (!g_jc_active || !d || d->imu.live) return;   // the timer's own period bounds how often the sequence is re-sent
-    jc_assert_mode(d);
+    if (!g_jc_active) return;
+    jc_route();   // the front end's callbacks can arrive before its slot is known, or before a unit is enumerated: settle both sides here too
+    for (int side = 0; side < 2; side++) {
+        jc_device *d = g_jc_side[side];
+        if (!d || d->imu.live) continue;   // the timer's own period bounds how often the sequence is re-sent
+        jc_assert_mode(d);
+    }
 }
 static void dm_motion_joycon_start(void (*changed)(void)) {
     const char *e = getenv("DM_MOTION"); if (e && !atoi(e)) return;
