@@ -690,7 +690,9 @@ static int shaking(uint64_t t) { return t >= atomic_load(&g_shake_t0) && t < ato
 // Every history entry is the newest sample, numbered by time. DM_MOTION=0 ignores live motion; DM_MOTION_AXES / DM_MOTION_ACC_SIGN map Apple's axes (motion_fusion.h);
 // DM_MOTION_GAIN sets the tilt correction (default 0.5); DM_MOTION_LOG=1 logs player 1's mapped sample once a second, for checking the axes
 enum { MOTION_STALE_NS = 300000000 };
-typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, received_ns, logged; } live_motion;
+typedef struct { pthread_mutex_t mu; motion_state st; uint64_t last_ns, received_ns, logged;
+    float bias[3], bias_sum[3], lp[3], fast[3]; int quiet, bias_n;   // a passive HID pad's own gyro bias, re-snapped while it rests
+} live_motion;
 static live_motion g_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
 static live_motion g_hid_motion[DM_PLAYERS] = {[0 ... DM_PLAYERS - 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}};
 static live_motion g_joy_motion[DM_PLAYERS][2] = {[0 ... DM_PLAYERS - 1] = {[0 ... 1] = {.mu = PTHREAD_MUTEX_INITIALIZER}}};   // each Joy-Con's own sensor (dm_motion_set_joy)
@@ -717,10 +719,30 @@ static void motion_set_to(live_motion *m, int p, const float acc[3], const float
     uint64_t now = now_ns(), t = sample_ns ? sample_ns : now;
     if (!t || t > now || now - t > MOTION_STALE_NS) return;
     pthread_mutex_lock(&m->mu);
+    if (!m->last_ns || now - m->received_ns > MOTION_STALE_NS) { motion_reset(&m->st); m->last_ns = 0; memset(m->lp, 0, sizeof m->lp); memset(m->fast, 0, sizeof m->fast); m->quiet = m->bias_n = 0; }
+    float rot_free[3], biased[3];   // source 2: a passive HID pad, no factory calibration: learn the bias while it lies still, as the Joy-Con reader does
+    if (source == 2) {
+        int quiet = 1;
+        for (int k = 0; k < 3; k++) {
+            float f = m->fast[k], l = m->lp[k];
+            m->fast[k] += 0.20f * (rot[k] - f);
+            m->lp[k] += 0.01f * (rot[k] - l);
+            if (fabsf(m->fast[k] - m->lp[k]) > 0.006f) quiet = 0;
+        }
+        if (quiet) {
+            if (++m->bias_n > 200) {   // ~1 s at 200 Hz: the unit is at rest and the slow filter is its bias
+                for (int k = 0; k < 3; k++) m->bias[k] = m->lp[k];
+                m->bias_n = 0;
+                LOG("[hid] motion player %d: gyro bias %+.4f %+.4f %+.4f rev/s (re-snapped at rest)", p + 1, m->bias[0], m->bias[1], m->bias[2]);
+            }
+        } else m->bias_n = 0;
+        for (int k = 0; k < 3; k++) biased[k] = rot[k] - m->bias[k];
+        memcpy(rot_free, biased, sizeof rot_free);
+    }
     if (!m->last_ns || now - m->received_ns > MOTION_STALE_NS) { motion_reset(&m->st); m->last_ns = 0; }
     if (m->last_ns && t <= m->last_ns) { pthread_mutex_unlock(&m->mu); return; }
     float dt = m->last_ns && t > m->last_ns ? (float)((double)(t - m->last_ns) / 1e9) : 0;
-    motion_update(&m->st, source ? &identity : &g_motion_map, acc, rot, dt, g_motion_gain);
+    motion_update(&m->st, source ? &identity : &g_motion_map, acc, source == 2 ? rot_free : rot, dt, g_motion_gain);
     if (g_motion_log && !p && t - m->logged > 1000000000ull) {
         m->logged = t;
         LOG("[hid] motion player 1 (%s): acc %+.2f %+.2f %+.2f G, gyro %+.3f %+.3f %+.3f rev/s (flat and still should read acc 0 0 -1)",
